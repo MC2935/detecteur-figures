@@ -37,7 +37,7 @@ INTERVALLES = {
     "15 min": ("15m", "60d"),
     "30 min": ("30m", "60d"),
     "1 heure": ("1h", "730d"),
-    "4 heures (reconstitué)": ("1h", "730d"),
+    "4 heures": ("1h", "730d"),
     "Jour": ("1d", "5y"),
     "Semaine": ("1wk", "10y"),
 }
@@ -458,7 +458,6 @@ with st.sidebar:
                "ou à l'écran d'accueil pour la retrouver.")
 
     st.header("Réglages")
-    libelle = st.selectbox("Unité de temps", list(INTERVALLES), index=2)
     sens = st.slider("Sensibilité des pivots (× ATR)", 1.0, 4.0, 2.0, 0.25,
                      help="Plus petit : plus de figures, plus de bruit. Plus grand : seulement les grandes figures.")
     figs = st.multiselect("Figures à détecter", list(FIGURES), default=list(FIGURES))
@@ -483,103 +482,113 @@ def analyser(ticker):
                    figures=codes_fig), None
 
 
-onglet_liste, onglet_scan, onglet_aide = st.tabs(["Ma liste", "Scanner", "Mode d'emploi"])
+# --- Sélecteurs principaux, en haut de page ------------------------------
+autres = [n_ for n_ in VALEURS if VALEURS[n_] not in liste]
+options_actions = [nom(t) for t in liste] + autres
+col_a, col_b = st.columns([2, 3])
+with col_a:
+    choix = st.selectbox("Action", options_actions, index=0,
+                         help="Tapez les premières lettres pour chercher. "
+                              "Vos valeurs suivies apparaissent en premier.")
+with col_b:
+    libelle = st.pills("Unité de temps", list(INTERVALLES), selection_mode="single",
+                       default="1 heure")
+if libelle is None:
+    libelle = "1 heure"
+ticker = next((t for t in liste if nom(t) == choix), VALEURS.get(choix, choix))
+
+onglet_analyse, onglet_liste, onglet_scan, onglet_aide = st.tabs(
+    ["Analyse", "Ma liste", "Scanner", "Mode d'emploi"])
+
+with onglet_analyse:
+    with st.spinner(f"Analyse de {choix}…"):
+        res, err = analyser(ticker)
+    if res is None:
+        st.warning(f"{choix} : {err}")
+    else:
+        data = res["data"]
+        last = float(data["Close"].iloc[-1])
+        syn = res["synthese"]
+        couleur = VERT if "haussier" in syn["verdict"] else ROUGE if "baissier" in syn["verdict"] else GRIS
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{choix} · {libelle}", fmt(last))
+        c2.metric("Dernière bougie", data.index[-1].strftime("%d/%m %H:%M"))
+        c3.markdown(f"<div style='padding-top:6px'>Lecture graphique<br>"
+                    f"<span style='font-size:1.5em;font-weight:700;color:{couleur}'>"
+                    f"{syn['verdict']}</span></div>", unsafe_allow_html=True)
+
+        st.plotly_chart(graphique(res, libelle, n_aff, montrer_hist,
+                                  {DESSINS[d] for d in dessins_noms}
+                                  & (codes_fig | {"objectifs", "sr", "canal", "obliques", "mm", "figures"})),
+                        use_container_width=True,
+                        config={"scrollZoom": True, "displaylogo": False})
+
+        st.markdown("#### Analyse automatique")
+        for l in commentaire(res, choix, libelle):
+            st.markdown(l)
+
+        with st.expander("Détail des figures actives"):
+            t_act = tableau_figures(res, libelle, True)
+            if t_act.empty:
+                st.write("Aucune.")
+            else:
+                st.dataframe(t_act, use_container_width=True, hide_index=True)
+
+        if "fvg" in codes_fig:
+            with st.expander("Imbalances (FVG) non comblées les plus proches"):
+                act = sorted([f for f in res["fvg"] if f["actif"]],
+                             key=lambda f: abs((f["haut"] + f["bas"]) / 2 - last))[:10]
+                if act:
+                    st.dataframe(pd.DataFrame([{
+                        "Date": data.index[f["idx"]].strftime("%d/%m/%y %H:%M"),
+                        "Type": f["biais"], "Bas": fmt(f["bas"]), "Haut": fmt(f["haut"]),
+                        "Position": "sous le cours" if f["haut"] < last
+                        else "au-dessus" if f["bas"] > last else "cours dedans",
+                        "Comblée à": f"{f['comblement'] * 100:.0f} %",
+                    } for f in act]), use_container_width=True, hide_index=True)
+                else:
+                    st.write("Aucune.")
+
+        with st.expander("Historique : les figures ont-elles fonctionné sur ce titre ?"):
+            s_h = stats_historiques(res)
+            if s_h.empty:
+                st.write("Pas assez de figures passées.")
+            else:
+                st.dataframe(s_h, use_container_width=True)
+                st.caption("Sur l'historique téléchargé, pour cette unité de temps et cette sensibilité. "
+                           "Un taux proche de 50 % ou moins : la figure n'apporte pas grand-chose ici.")
+            th = tableau_figures(res, libelle, False)
+            if not th.empty:
+                st.dataframe(th, use_container_width=True, hide_index=True)
 
 with onglet_liste:
     if not liste:
-        st.info("Ajoutez des valeurs dans « Ma liste d'actions » (menu ☰ / barre latérale).")
+        st.info("Ajoutez des valeurs dans « Ma liste d'actions » (flèche › en haut à gauche).")
     else:
-        # --- Vue d'ensemble -------------------------------------------------
-        resultats, lignes = {}, []
+        lignes = []
         with st.spinner("Analyse de la liste…"):
             for t in liste:
                 r, err = analyser(t)
-                resultats[t] = (r, err)
                 if r is None:
                     lignes.append({"Valeur": nom(t), "Cours": "—", "Var.": "—",
                                    "Lecture": f"⚠️ {err}", "Figures actives": 0,
                                    "Figure principale": "—"})
                     continue
                 d = r["data"]
-                last = float(d["Close"].iloc[-1])
+                lc = float(d["Close"].iloc[-1])
                 ref = float(d["Close"].iloc[max(0, len(d) - 21)])
                 act = sorted([p for p in r["figures"] if p["active"]], key=lambda p: -p["score"])
                 v = r["synthese"]["verdict"]
                 icone = "🟢" if "haussier" in v else "🔴" if "baissier" in v else "⚪"
                 lignes.append({
-                    "Valeur": nom(t), "Cours": fmt(last), "Var.": f"{pct(last, ref):+.1f} %",
+                    "Valeur": nom(t), "Cours": fmt(lc), "Var.": f"{pct(lc, ref):+.1f} %",
                     "Lecture": f"{icone} {v}", "Figures actives": len(act),
                     "Figure principale": f"{act[0]['figure']} ({act[0]['statut']})" if act else "—",
                 })
         st.dataframe(pd.DataFrame(lignes), use_container_width=True, hide_index=True)
-        st.caption(f"Var. = variation sur les 20 dernières bougies ({libelle.lower()}).")
-
-        # --- Sélection d'une action ----------------------------------------
-        choix = st.pills("Choisir une action à afficher", [nom(t) for t in liste],
-                         selection_mode="single", default=nom(liste[0]))
-        if choix is None:
-            choix = nom(liste[0])
-        ticker = next(t for t in liste if nom(t) == choix)
-        res, err = resultats[ticker]
-
-        if res is None:
-            st.warning(f"{choix} : {err}")
-        else:
-            data = res["data"]
-            last = float(data["Close"].iloc[-1])
-            syn = res["synthese"]
-            couleur = VERT if "haussier" in syn["verdict"] else ROUGE if "baissier" in syn["verdict"] else GRIS
-
-            st.subheader(f"{choix} · {libelle}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Dernier cours", fmt(last))
-            c2.metric("Dernière bougie", data.index[-1].strftime("%d/%m %H:%M"))
-            c3.markdown(f"<div style='padding-top:6px'>Lecture graphique<br>"
-                        f"<span style='font-size:1.5em;font-weight:700;color:{couleur}'>"
-                        f"{syn['verdict']}</span></div>", unsafe_allow_html=True)
-
-            st.plotly_chart(graphique(res, libelle, n_aff, montrer_hist,
-                                      {DESSINS[d] for d in dessins_noms} & (codes_fig | {"objectifs", "sr", "canal", "obliques", "mm", "figures"})),
-                            use_container_width=True,
-                            config={"scrollZoom": True, "displaylogo": False})
-
-            st.markdown("#### Analyse automatique")
-            for l in commentaire(res, choix, libelle):
-                st.markdown(l)
-
-            with st.expander("Détail des figures actives"):
-                t_act = tableau_figures(res, libelle, True)
-                if t_act.empty:
-                    st.write("Aucune.")
-                else:
-                    st.dataframe(t_act, use_container_width=True, hide_index=True)
-
-            if "fvg" in codes_fig:
-                with st.expander("Imbalances (FVG) non comblées les plus proches"):
-                    act = sorted([f for f in res["fvg"] if f["actif"]],
-                                 key=lambda f: abs((f["haut"] + f["bas"]) / 2 - last))[:10]
-                    if act:
-                        st.dataframe(pd.DataFrame([{
-                            "Date": data.index[f["idx"]].strftime("%d/%m/%y %H:%M"),
-                            "Type": f["biais"], "Bas": fmt(f["bas"]), "Haut": fmt(f["haut"]),
-                            "Position": "sous le cours" if f["haut"] < last
-                            else "au-dessus" if f["bas"] > last else "cours dedans",
-                            "Comblée à": f"{f['comblement'] * 100:.0f} %",
-                        } for f in act]), use_container_width=True, hide_index=True)
-                    else:
-                        st.write("Aucune.")
-
-            with st.expander("Historique : les figures ont-elles fonctionné sur ce titre ?"):
-                s = stats_historiques(res)
-                if s.empty:
-                    st.write("Pas assez de figures passées.")
-                else:
-                    st.dataframe(s, use_container_width=True)
-                    st.caption("Sur l'historique téléchargé, pour cette unité de temps et cette sensibilité. "
-                               "Un taux proche de 50 % ou moins : la figure n'apporte pas grand-chose ici.")
-                th = tableau_figures(res, libelle, False)
-                if not th.empty:
-                    st.dataframe(th, use_container_width=True, hide_index=True)
+        st.caption(f"Unité de temps : {libelle.lower()}. Var. = variation sur les 20 dernières bougies. "
+                   "Pour voir le graphique d'une valeur, choisissez-la dans « Action » en haut de page.")
 
 with onglet_scan:
     st.write("Analyse toutes les valeurs proposées (pas seulement votre liste) "
@@ -614,10 +623,10 @@ with onglet_scan:
 with onglet_aide:
     st.markdown("""
 **Utilisation**
-1. Dans la barre latérale (☰ sur mobile), choisissez vos valeurs dans **Ma liste d'actions**.
-2. L'onglet **Ma liste** affiche un tableau récapitulatif, puis touchez le nom d'une action :
-   son graphique et son **analyse automatique** s'affichent.
-3. La liste est mémorisée dans l'adresse de la page : mettez-la en favori.
+1. En haut de la page, choisissez l'**Action** et touchez l'**Unité de temps** : le graphique et l'analyse s'affichent aussitôt.
+2. L'onglet **Ma liste** résume la lecture de toutes vos valeurs suivies.
+3. Pour modifier vos valeurs suivies ou les réglages fins : flèche **›** en haut à gauche.
+   La liste est mémorisée dans l'adresse de la page : mettez-la en favori.
 
 **Ce que fait l'outil**
 - Repère les sommets et creux significatifs (pivots), d'une amplitude minimale de *sensibilité × ATR*.
